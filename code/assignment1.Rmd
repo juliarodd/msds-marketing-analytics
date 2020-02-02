@@ -1,0 +1,1301 @@
+---
+title: "Julia Rodd Solo 1"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE,warning=FALSE,message=FALSE,error=FALSE, fig.align = 'center') 
+# data prep
+library(tidyverse)
+library(reshape)
+library(mice) # imputation
+
+# data analysis
+library(corrplot)
+
+# modeling
+library(cluster)
+library(useful)
+library(Hmisc)
+library(HSAUR)
+library(MVA)
+library(HSAUR2)
+library(fpc)
+library(mclust)
+library(lattice)
+library(car)
+library(maptree)
+library(proxy)
+library(factoextra)
+
+# plotting/tables
+library(gridExtra)
+library(grid)
+library(kableExtra)
+
+# define global color palette
+cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7","#000000", "#D2691E")
+
+# set working directory
+setwd("C:/Users/julia/OneDrive/Documents/Code/msds-marketing-analytics/code")
+
+```
+
+# Introduction
+
+App Happy, a company that has historically provided B2B analytic apps, wants to better understand which customers will be more interested in their new social entertainment app. To help answer this question, a general attitudinal post hoc segmentation analysis is created using survey responses from 1800 respondents. Several different heuristic clustering methods are considered with comparisons made on their goodness of fit. Ultimately, one cluster solution is selected to develop customer profiles using all available survey questions. These customer profiles are used to inform app recommendations, but more importantly, to provide commentary on the limitations of the current approach. As a next step, information is provided on how to classify new customers into the current segmentation scheme and challenges that may be faced in the future. 
+
+# Market Segmentation
+
+In this section, a segmentation scheme is created using the 40 attitudinal variables in the data set. Only the attitudinal questions are considered, since the primary goal is to create a general attitudinal post hoc segmentation analysis. To select the final segmentation scheme, several different clustering methods are used with results and commentary provided below.
+
+```{r, load data}
+# read in our data
+load("../data/apphappyData.RData")
+
+numdata <- apphappy.3.num.frame
+numdata <- numdata %>%
+  select(-q5r1) # drop this per direction from dr srinivasan
+
+```
+
+## Exploratory Data Analysis
+
+To begin the segmentation scheme process, we start by analyzing the variables within the data set to ensure the shape, values, and scope all make sense. All the variables in our data set are coded as numeric.
+
+Below is a table that shows variables with missing values.
+
+```{r, inspect for missing vals}
+# summary(numdata)
+# we summarize our missing values across columns
+numdata_missing_sum <- numdata %>%
+  summarise_all(funs(sum(is.na(.))/n())) %>%
+  gather("rowname","missing") %>%
+  filter(missing != 0) %>%
+  mutate(missing = paste0(round(missing*100,1),"%"))
+
+```
+
+We can see that only two questions have missing values, and these questions are not attitudinal questions. Because the percentage of missing values is < 10% for both questions, we will keep these questions in our data set. However, we will need to address these missing values before we start clustering, as we will want to leverage these variables for profiling.
+
+To correct missing values, we will utilize the R mice package to impute our missing data values with plausible data values. The mice packages assumes that the data is missing at random. For our purposes, we will assume that our data is missing at random, as we have not been given information that tells us otherwise. 
+
+```{r, use mice for imputation, results='hide'}
+# The mice package imputes missing values using a decision tree, and it repeats this process multiple times. This approach is advantageous over other imputation methods, such as imputing via the mean, as it reduces the bias of the imputed values. With this package, we will utilize the predictive mean matching (pmm) method for imputation, since all our variables are numeric.
+
+# aggr(numdata, col=c(cbPalette[6],cbPalette[2]), numbers=TRUE, sortVars=FALSE, combined=TRUE, labels=colnames(numdata), cex.axis=0.7, oma = c(8,3,3,2), ylab=c("Pattern of Missing Data"))
+
+# impute missing values using mice
+# use predictive mean matching b/c we have numeric data
+# increase maxit from 5 to 50 to have more iterations/stability with data
+tempData <- mice(numdata,m=5,maxit=50,meth='pmm',seed=500) 
+numdata_complete <- complete(tempData,1)
+summary(numdata_complete)
+
+```
+
+```{r, define attitudinal data}
+# narrow in on attitudinal data
+attitudinal_data <- numdata_complete %>%
+  select(starts_with("q24"),starts_with("q25"),starts_with("q26"))
+
+```
+
+Now that we have addressed missing values, we will focus on the attitudinal questions within our data set. We start with a correlation plot to determine if variables are related and if their coding makes sense.
+
+```{r,initial corrplot, fig.height=7.5, fig.width=8}
+corrplot(cor(attitudinal_data),tl.col = "black", type="full", method="color",title = "Correlation Plot of Attitudinal Variables",mar=c(0,0,1,0))
+
+# if use order in corrplot, then it is sorted not in the way we want, which is question order
+
+```
+
+Right away, w can see that q24r2, q24r9, and q25r6 all have negative correlations with other variables, which does not make sense since all questions/variables are using the same Likert (1-6) scale. In short, these questions must have a different sentiment within them compared to the other questions. This situation will need to be corrected before moving forward with the segmentation scheme.
+
+For any cluster analysis, it is helpful to view a scatter plot of the first two principal components. Because we have 40 attitudinal variables, we cannot view their pattern readily in a 40-dimensional space. Principal component analysis preserves the high dimensional pattern of the data but allows us to view that pattern in  two dimensions. For reference, a scree plot is also shown which plots the number of principal components against the amount of total variance that they explain. We are looking to see that the first two components explain a substantial amount of variance.
+
+```{r, pca and scree plots function}
+pca_scree_plots_function <- function(df,n){
+  # Calculate PCA and pick off PCA 1 and 2 for plotting
+  pca <- princomp(df)
+  pca.1 <- pca$scores[,1]
+  pca.2 <- pca$scores[,2]
+  pca_df <- data.frame(pc1=pca.1, pc2=pca.2)
+  
+  pca_plot <- pca_df %>%
+    ggplot(aes(x = pc1, y = pc2)) + 
+    geom_point(color = cbPalette[6],size=.75,alpha=.6) + 
+    labs(title = "Plot of First Two Principal Components", x="PC1",y="PC2") +
+    theme(text = element_text(size = 10, face = "bold")) 
+  
+  # Define values to make a scree plot
+  scree.values <- (pca$sdev^2)/sum(pca$sdev^2)
+  variance.values <- cumsum(pca$sdev^2)/sum(pca$sdev^2)
+  Component=seq(from = 1, to = n, by = 1)
+  scree_df <- data.frame(Eigenvalue=scree.values,
+                         TotalVariation=variance.values,
+                         Component=Component)
+  scree_df <- scree_df %>%
+    top_n(n,Eigenvalue)
+  
+  scree_plot <- scree_df %>%
+    ggplot(aes(x=Component)) +
+    geom_line(aes(y=Eigenvalue, colour=cbPalette[6]),size=1) + 
+    geom_point(aes(y=Eigenvalue, colour=cbPalette[6]),size=2) + 
+    geom_line(aes(y=TotalVariation, colour=cbPalette[7]),size=1) + 
+    geom_point(aes(y=TotalVariation, colour=cbPalette[7]),size=2) +
+    geom_hline(yintercept=.8) +
+    geom_text(aes(x = 3, y = .82,label = "80% line"), size=3) +
+    scale_color_manual(values=cbPalette[6:7],
+                       labels=c("Individual\nVariance","Total\nVariance")) +
+    theme(text = element_text(size = 10, face = "bold")) +
+    labs(title="Scree Plot", x="Number of Components",y="Percent") +
+    scale_y_continuous(labels=function(x){paste0(x*100,"%")}) +
+    guides(colour=guide_legend("Legend"))
+  
+  return(list(pca_df, pca_plot, scree_plot))
+  
+}
+
+```
+
+
+```{r,initial pca and scree plots, fig.height=3.5, fig.width=8}
+initial_pca_scree_vals_plots <- pca_scree_plots_function(attitudinal_data,20)
+
+pca_plot <- initial_pca_scree_vals_plots[[2]]
+
+scree_plot <- initial_pca_scree_vals_plots[[3]]
+
+grid.arrange(pca_plot,scree_plot,ncol=2,widths=6:7,top=textGrob("PCA and Scree Plots with Raw Attitudinal Variables", gp=gpar(fontsize=14, fontface = "bold")))
+```
+
+Immediately, there are several key observations from these plots:
+
+* There is a higher concentration of points in the middle of the principal components plot
+* There are some outliers, such as values that have a PC1 value > 10
+* Overall, we do not see clear groupings within the data, but this does not mean that cluster analysis is not appropriate. 
+
+In fact, if we look at the scree plot to see how much variation the first two principal components explain, it is a very low number: 36.1%. This result means that we have to go up to ~14 components to better see the data pattern. Viewing the first 20 components gets us to our desired threshold of 80% variation.
+
+Therefore, it is clear that data transformations are needed to better discern trends within the data and prepare this data for clustering techniques. For now, we will not omit any outliers, as data transformations may help to limit their influence. We will reassess outlier removal later in the clustering process.
+
+Below is a table that summarizes the data transformation approach. Like questions are grouped together, with responses averaged. By doing this, we are able to reduce the number of questions that are considered for the segmentation scheme and hopefully increase the signal within our data.
+
+```{r,sorting and inspecting pca values}
+# summary(pca)
+pca_df <- tibble::rowid_to_column(initial_pca_scree_vals_plots[[1]], "ID") # this was just to more readily determine row 
+
+sortpca <- sort(pca_df$pc1,decreasing=TRUE)
+
+# attitudinal_data["247",] #anwered mostly 6's but a few 1's
+# attitudinal_data["394",] #answered mostly 6's but a few 1's, 3's, and a 4
+# attitudinal_data["1749",] #not starting to see a clear pattern
+# attitudinal_data["801",]
+# attitudinal_data["1040",]
+# attitudinal_data["813",]
+# attitudinal_data["1018",]
+# 
+# attitudinal_data["27",] #answered 1 for everything
+# attitudinal_data["111",] #answered 1 for everything
+# attitudinal_data["960",] #answered 1 for everything
+```
+
+```{r,table of questions}
+text_tbl <- data.frame(
+  Orig_Question = c("24 - Technology","24 - Technology","24 - Technology","24 - Technology","24 - Technology",
+                    "25 - Leadership","25 - Leadership","25 - Leadership","25 - Leadership",
+                    "26 - Shopping","26 - Shopping","26 - Shopping","26 - Shopping","26 - Shopping"),
+  Revised_Question = c("24A - Positive toward Technology", "24B - Technology Benefits", "24C - Music/TV",
+                       "24D - Communications","24E - Negative toward Technology",
+                       "25A - Leadership","25B - Sense of Control","25C - Drive","25D - Negative toward Leadership",
+                       "26A - Bargain Shopping","26B - App Show Off","26C - Children","26D - Money toward Phone/App","26E - High End Brands"),
+  Groupings = c("1,2,3","5,6","7,8","10,11","4,19,12",
+                "1,2,3,4,5","7,8","9,10,11","6,12",
+                "3,4,5,6","8,9,10","11","12,13,14,17","15,16,7,18")
+)
+
+kable(text_tbl, "html", booktabs = T, col.names=c("Original Question","Revised Question","Question Groupings")) %>%
+  kable_styling(full_width = F, position = "center") %>%
+  row_spec(0, bold = T) 
+
+```
+
+```{r,combine questions}
+# combine our attitudinal data
+attitudinal_data2 <- attitudinal_data %>%
+  mutate(q24a = (q24r1+q24r2+q24r3)/3,
+         q24b = (q24r5+q24r6)/2,
+         q24c = (q24r7+q24r8)/2,
+         q24d = (q24r10+q24r11)/2,
+         q24e = (q24r4+q24r9+q24r12)/3,
+         q25a = (q25r1+q25r2+q25r3+q25r4+q25r5)/5,
+         q25b = (q25r7+q25r8)/2,
+         q25c = (q25r9+q25r10+q25r11)/3,
+         q25d = (q25r6+q25r12)/2,
+         q26a = (q26r3+q26r4+q26r5+q26r6)/4,
+         q26b = (q26r8+q26r9+q26r10)/3,
+         q26c = q26r11,
+         q26d = (q26r12+q26r13+q26r14+q26r17)/4,
+         q26e = (q26r15+q26r16+q26r7+q26r18)/4)
+
+# define this later for plotting
+attitudinal_data_raw <- attitudinal_data2 %>%
+ select(-contains("r")) # we want to select our new questions; the orig questions contain an 'r' in them 
+
+attitudinal_data_revised <- attitudinal_data2 %>%
+   select(-contains("r")) %>% # we want to select our new questions; the orig questions contain an 'r' in them
+  # easier to write out these mutates b/c of varying transformations
+  mutate(q24a = log(q24a),
+         q24b = log(q24b),
+         q24c = log(q24c),
+         q24d = log(q24d),
+         q24e = sqrt(q24e),
+         q25a = sqrt(q25a),
+         q25b = log(q25b),
+         q25c = log(q25c),
+         q25d = sqrt(q25d),
+         q26a = sqrt(q26a),
+         q26b = sqrt(q26b),
+         q26c = sqrt(q26c),
+         q26d = sqrt(q26d),
+         q26e = sqrt(q26e))
+
+```
+
+As a quick check, we go back to our correlation plot to see if we see the same direction on all the questions.
+
+```{r,revised corrplot, fig.height=3, fig.width=6}
+corrplot(cor(attitudinal_data_revised),tl.col = "black", type="full", method="color",title = "Correlation Plot of Attitudinal Variables",mar=c(0,0,1,0))
+
+# if use order in corrplot, then it is sorted not in the way we want, which is question order
+
+```
+
+From the correlation plot, we can see that after grouping questions together, now all questions have the same correlation direction which is what we wanted. Additionally, there are differences in correlations between questions, but correlation does not influence cluster analysis. 
+
+Next, we take another look at our principal components and scree plots to see if we can better discern data patterns in two-dimensional space. The first two plots show the results of combining like questions together. As part of data exploration, in addition to transforming or grouping like variables together, transformations in the form of normalizing responses was also considered (i.e. log or sqrt). Therefore, the next two plots show the results of transformed and normalized attitudinal variables.
+
+```{r,revised pca and scree plots, fig.height=3.5,fig.width=8}
+# raw data only
+raw_pca_scree_vals_plots <- pca_scree_plots_function(attitudinal_data_raw,14)
+
+pca_raw_plot <- raw_pca_scree_vals_plots[[2]]
+
+scree_raw_plot <- raw_pca_scree_vals_plots[[3]]
+
+# now with normalized data
+revised_pca_scree_vals_plots <- pca_scree_plots_function(attitudinal_data_revised,14)
+
+pca_plot <- revised_pca_scree_vals_plots[[2]]
+
+scree_plot <- revised_pca_scree_vals_plots[[3]]
+
+# plot them side by side to see impact
+grid.arrange(pca_raw_plot,scree_raw_plot,ncol=2,widths=6:7,top=textGrob("PCA and Scree Plots with Transformed Attitudinal Variables", gp=gpar(fontsize=14, fontface = "bold")))
+
+grid.arrange(pca_plot,scree_plot,ncol=2,widths=6:7,top=textGrob("PCA and Scree Plots with Transformed and Normalized Attitudinal Variables", gp=gpar(fontsize=14, fontface = "bold")))
+```
+
+In the first PCA plot, we can at least more visually see that there are at least two groupings within the data. However, we still see some outliers in the upper right-hand corner of the plot. These should be removed.
+
+More importantly, we can see that fewer components explain greater variance. In fact, the first two principal components now explain 56% of the total variance in the data, which is a huge improvement over the 36% from the raw data. Also, the first six principal components explain 80% of the variation in the data, whereas before, we needed the full 20 components to get to 80% of total variance explained. This result means that our data transformations helped to reduce noise and increase the signal or patterns within our data set.
+
+In analyzing the next set of plots, we can see that normalizing question groups does not improve the signal. Thus, we will just consider the variables that have been grouped/averaged together. 
+
+Before moving forward, it is worth noting that 31 data points have been removed. The majority of these data points, 25 of them, were removed since all of these responses had a score of 1 across all questions. These responses are not considered typical, which is why they were excluded from this analysis. Additionally, six other data points were removed based on visually examining the first two principal components. This step is done to improve the fit of the clusters and to better discern trends among the resulting clusters.
+
+For each clustering technique, a cluster size between 2-8 was considered, since the scree plot shows an elbow at two and offers minimal improvement in variance after eight components. Ultimately, the best performing cluster solution was selected within each method and is shown in detail below.
+
+```{r,inspect and remove outliers}
+# summary(pca)
+pca_df <- tibble::rowid_to_column(raw_pca_scree_vals_plots[[1]], "ID") #this was just to more readily determine which rows
+
+sortpca <- sort(pca_df$pc1,decreasing=TRUE)
+
+#points to remove
+# attitudinal_data_revised["1613",] #low responses
+# attitudinal_data_revised["1069",] #high/middle
+# attitudinal_data_revised["1095",] #generally lows and then high for 26c
+# attitudinal_data_raw["1069",] #high/middle
+# attitudinal_data_raw["247",] #low for 24, high for others
+# attitudinal_data_raw["394",] #middle for 24, high for others
+# attitudinal_data_raw["1749",] #higher end for all
+# attitudinal_data_raw["801",] #5's for all
+# attitudinal_data_raw["1040",] #5's for all
+#25 responses that all answered 1
+
+# we deselect the outliers based on their row number
+# we do this for later
+numdata_tmp <- cbind(attitudinal_data_raw,numdata_complete$caseID)
+id_mapping <- numdata_tmp %>%
+  dplyr::mutate(outlier_flag = ifelse(row_number() %in% c(1069,247,394,1749,801,1040,27,111,156,224,259,287,380,545,625,647,728,960,1046,1122,1153,1224,1227,1315,1336,1359,1478,1534,1573,1597,1791),1,0),
+                row_num = row_number())  %>%
+  select("numdata_complete$caseID",row_num, outlier_flag) %>% 
+  mutate(caseID = numdata_complete$caseID) %>% #rename wasn't working for some reason so did it this way
+  select(-"numdata_complete$caseID")
+
+attitudinal_data_final <- attitudinal_data_raw %>%
+  filter(!(row_number() %in% c(1069,247,394,1749,801,1040,27,111,156,224,259,287,380,545,625,647,728,960,1046,1122,1153,1224,1227,1315,1336,1359,1478,1534,1573,1597,1791)))
+
+```
+
+```{r,hist exploration for transformations,fig.width=8}
+# hist(attitudinal_data_revised$q24a)
+# hist(log(attitudinal_data_revised$q24a))
+# 
+# hist(attitudinal_data_revised$q24b)
+# hist(log(attitudinal_data_revised$q24b))
+# 
+# hist(attitudinal_data_revised$q24c)
+# hist(log(attitudinal_data_revised$q24c))
+# 
+# hist(attitudinal_data_revised$q24d)
+# hist(log(attitudinal_data_revised$q24d))
+# 
+# hist(attitudinal_data_revised$q24e)
+# hist(sqrt(attitudinal_data_revised$q24e))
+# hist(log(attitudinal_data_revised$q24e))
+# 
+# hist(attitudinal_data_revised$q25a)
+# hist(sqrt(attitudinal_data_revised$q25a))
+# 
+# hist(attitudinal_data_revised$q25b)
+# hist(log(attitudinal_data_revised$q25b))
+# 
+# hist(attitudinal_data_revised$q25c)
+# hist(log(attitudinal_data_revised$q25c))
+# 
+# hist(attitudinal_data_revised$q25d)
+# hist(sqrt(attitudinal_data_revised$q25d))
+# 
+# hist(attitudinal_data_revised$q26a)
+# hist(sqrt(attitudinal_data_revised$q26a))
+# 
+# hist(attitudinal_data_revised$q26b)
+# hist(sqrt(attitudinal_data_revised$q26b))
+# 
+# hist(attitudinal_data_revised$q26c)
+# hist(sqrt(attitudinal_data_revised$q26c))
+# 
+# hist(attitudinal_data_revised$q26d)
+# hist(sqrt(attitudinal_data_revised$q26d))
+# 
+# hist(attitudinal_data_revised$q26e)
+# hist(sqrt(attitudinal_data_revised$q26e))
+
+```
+
+## Hierarchical Clustering
+
+We start our cluster analysis with hierarchical clustering. We use Euclidean distance as our distance measure and utilize the complete linkage method for measuring the distances between clusters. Average linkage method was also considered but complete linkage yielded better results.
+
+```{r,echo=FALSE,warning=FALSE,message=FALSE}
+my.data.dist <- dist(attitudinal_data_final)
+
+hclustmodel <- hclust(my.data.dist, method = 'complete')
+#plot(hclustmodel)
+
+```
+
+We elect not to show the cluster dendrogram, as it is a messy plot due to the larger size of our data set. Rather, we will show metrics to demonstrate the performance of this solution.
+
+First, we show a silhouette plot. A silhouette plot is a helpful visual for assessing the goodness of fit of a cluster solution. Intuitively, it plots the average distance between a data point and other data points in the same cluster and compares that average distance between that data point and other data points in different clusters (silhouette index). We can interpret the final silhouette index as follows:
+
+* If the silhouette index is near 1, then a data point is appropriately assigned to its current cluster;
+* If the silhouette index is near -1, then a data point is incorrectly assigned;
+* If the silhouette index is near 0, then a data point could belong to multiple clusters. 
+
+From the silhouette plot, we can also obtain a total average silhouette index across all data points, which is a useful metric for assessing the total fit of the cluster solution.
+
+After comparing and contrasting different hierarchical cluster solutions, the best solution was a 2-cluster solution. The resulting silhouette plot is below.
+
+```{r,silhouette plot, fig.height=3,fig.width=6, results='hide',align='center'}
+set.seed(123)
+cut.2 <- cutree(hclustmodel, k=2)
+sil <- silhouette(cut.2,my.data.dist)
+sil_sum <- summary(sil)
+#plot(sil)
+
+#http://www.sthda.com/english/wiki/print.php?id=236#pam-partitioning-around-medoids
+fviz_silhouette(sil) +
+  theme(text = element_text(size = 10, face = "bold")) + 
+  labs(y="Silhouette Width") +
+  scale_fill_manual(values = cbPalette) +
+  scale_color_manual(values = cbPalette)
+
+```
+
+From the silhouette plot, we can see that the fit of the cluster solutions is not that great. Each cluster, although being fairly equal in size, has a decent amount of values that have a negative silhouette index. This result indicates that the cluster fit could be improved within each of the clusters.
+
+The tables below show a summary of the hierarchical 2-cluster solution.
+
+```{r,define hclust gof stats}
+# TSS
+numsubmat <- as.matrix(attitudinal_data_final)
+overallmean <- matrix(apply(numsubmat,2,mean),nrow=1)
+TSS <- sum(dist(numsubmat,overallmean)^2)
+
+# alternate way
+# subdat <- attitudinal_data_final
+# TSS <- (nrow(subdat)-1)*sum(apply(subdat,2,var))
+
+# WSS, BSS
+WSS <- cluster.stats(dist(attitudinal_data_final),cut.2, alt.clustering=NULL)$within.cluster.ss
+BetSS <- TSS-WSS
+
+rsquare <- paste0(round((BetSS/TSS)*100,1),"%")
+
+```
+
+```{r,plot hclust gof stats,results='asis'}
+ #tables for output
+hclust_metrics <- as.data.frame(rbind(round(WSS,2),rsquare,round(sil_sum$avg.width,2)))
+colnames(hclust_metrics) <- "Result"
+hclust_metrics$Metric <- c("Within SS","R-square","Avg Silhouette Width")
+hclust_metrics <- hclust_metrics[,c(2,1)]
+
+hclust_cluster_results <- cbind(as.data.frame(sil_sum$clus.sizes),as.data.frame(round(sil_sum$clus.avg.widths,2)))
+colnames(hclust_cluster_results) <- c("Cluster","Size","Average Width") 
+
+kable(hclust_metrics, "html", booktabs = T, row.names = FALSE) %>%
+  kable_styling("striped",position = "center", full_width = FALSE) %>%
+  add_header_above(c("Hierarchical Clustering Key Metrics" = 2))  %>%
+  row_spec(0, bold=T)
+
+kable(hclust_cluster_results, "html", booktabs = T,row.names = FALSE) %>%
+  kable_styling("striped",position = "center", full_width = FALSE) %>%
+  add_header_above(c("Hierarchical Clustering Cluster Results" = 3))  %>%
+  row_spec(0, bold=T)
+
+```
+
+From the tables above, we can see that R-squared is sub par at 19.9%, and the average silhouette width is closer to 0 than desired. This indicates that the cluster results overall are sub par. The Within SS is shown, but there is no context yet for the performance via Within SS. 
+
+Additionally, we can see that two clusters have a fairly even size. The average silhouette width within each cluster is also not as great as it could be, which is further support for the poor results here.
+
+While it is likely that the hierarchical clustering solution will not be the final solution, it still enables comparisons against other techniques.
+
+## K-means Clustering
+
+We start the k-means clustering section by displaying the result of our selected 5-cluster solution.
+
+```{r,kmeans model and silhouette plot,fig.height = 4, fig.width=8,results='hide',align='center'}
+set.seed(123)
+# clusterresults2 <- kmeans(attitudinal_data_final,2)
+# plot(clusterresults2, data=attitudinal_data_final)
+# 
+# clusterresults3 <- kmeans(attitudinal_data_final,3)
+# 
+# clusterresults4 <- kmeans(attitudinal_data_final,4)
+# plot(clusterresults4, data=attitudinal_data_final)
+
+clusterresults5 <- kmeans(attitudinal_data_final,5)
+# plot(clusterresults5, data=attitudinal_data_final)
+
+# clusterresults6 <- kmeans(attitudinal_data_final,6)
+# plot(clusterresults6, data=attitudinal_data_final)
+# 
+# clusterresults7 <- kmeans(attitudinal_data_final,7)
+# plot(clusterresults7, data=attitudinal_data_final)
+# 
+# clusterresults8 <- kmeans(attitudinal_data_final,8)
+# plot(clusterresults8, data=attitudinal_data_final)
+
+clusterresults <- clusterresults5
+dissE <- daisy(attitudinal_data_final)
+dE2 <- dissE^2
+sil_kmeans <- silhouette(clusterresults$cluster, dE2)
+sil_sum <- summary(sil_kmeans)
+
+kmeans_plot <- plot(clusterresults5, data=attitudinal_data_final) + 
+  theme(text = element_text(size = 10, face = "bold")) +
+  scale_color_manual(values = cbPalette) +
+  guides(color=FALSE)
+
+kmeans_silhouette_plot <- fviz_silhouette(sil_kmeans) +
+  theme(text = element_text(size = 10, face = "bold")) + 
+  labs(y="Silhouette Width") +
+  scale_fill_manual(values = cbPalette) +
+  scale_color_manual(values = cbPalette)
+
+grid.arrange(kmeans_plot,kmeans_silhouette_plot,ncol=2,widths=6:7)
+
+```
+
+Visually, we can see that there appears to be minimal overlap across the clusters, which is what we want. All of the clusters appear to be unique.
+
+From the silhouette plot, we can visually see that the clusters are of different sizes. That being said, we can already see a higher overall average silhouette index compared to the hierarchical solution. Of note, though, all clusters except cluster 1 have some values with a negative silhouette index. This observation is an indication of a potential lack of fit. The values that have a negative silhouette index are likely on the border of the k-means plot.
+
+```{r,kmeans gof stats, results='hide'}
+#plot(sil_kmeans)
+
+#TSS, WSS, r-square
+TSS <- clusterresults$totss
+WSS <- clusterresults$tot.withinss
+BetSS <- clusterresults$betweenss
+rsquare <- paste0(round((BetSS/TSS)*100,1),"%")
+
+```
+
+The tables below provide another perspective on the goodness of fit of this solution.
+
+```{r,show kmeans gof stats,results='asis'}
+#tables for output
+kmeans_metrics <- as.data.frame(rbind(round(WSS,2),rsquare,round(sil_sum$avg.width,2)))
+colnames(kmeans_metrics) <- "Result"
+kmeans_metrics$Metric <- c("Within SS","R-square","Avg Silhouette Width")
+kmeans_metrics <- kmeans_metrics[,c(2,1)]
+
+kmeans_cluster_results <- cbind(as.data.frame(sil_sum$clus.sizes),as.data.frame(round(sil_sum$clus.avg.widths,2)))
+colnames(kmeans_cluster_results) <- c("Cluster","Size","Average Width") 
+
+kable(kmeans_metrics, "html", booktabs = T, row.names = FALSE) %>%
+  kable_styling("striped",position = "center",full_width = FALSE) %>%
+  add_header_above(c("K-means Clustering Key Metrics" = 2))  %>%
+  row_spec(0, bold=T)
+
+kable(kmeans_cluster_results, "html", booktabs = T, row.names = FALSE) %>%
+  kable_styling("striped",position = "center", full_width = FALSE) %>%
+  add_header_above(c("K-means Clustering Cluster Results" = 3))  %>%
+  row_spec(0, bold=T)
+
+```
+
+Compared to the hierarchical cluster solution, we can see that R-squared and Total Within SS are improved. In addition, the average silhouette width is higher, as it is now .26 instead of .16. 
+
+However, the cluster sizes are not as even compared to the hierarchical cluster solution. Cluster 1, though, has a high average silhouette width at .44 due to its lack of negative silhouette index values, while the remaining clusters have lower average silhouette widths because of their negative values.
+
+In summary, the 5-cluster k-means solution offers improvements over the 2-cluster hierarchical cluster solution when analyzing all key metrics, but it does not improve on the basis of having evenly-sized clusters.
+
+## PAM Clustering
+
+Next, we explore with the Partitioning Around Medoids (PAM) clustering technique. PAM utilizes the median or an actual value for the center of a cluster, whereas K-means uses the mean. Therefore, PAM is more robust against outliers.
+
+We start with a plot of the 4-cluster PAM cluster solution, along with a silhouette plot.
+
+```{r,pam model and silhouette plot, fig.height=4,fig.width=8,results='hide',align='center'}
+set.seed(123)
+clusterresultsPAM4 <-pam(attitudinal_data_final,4) 
+pam_sum <- summary(clusterresultsPAM4)
+# str(clusterresultsPAM5$silinfo)
+# plot(clusterresultsPAM5, which.plots=1)
+# plot(clusterresultsPAM5, which.plots=2)
+
+pam_plot <- fviz_cluster(clusterresultsPAM4, geom = "point") + 
+  theme(text = element_text(size = 10, face = "bold")) +
+  labs(title="PAM Cluster Plot", x="Principal Component 1",y="Principal Component 2") +
+  scale_color_manual(values = cbPalette) +
+  guides(color=FALSE,fill=FALSE,shape=FALSE)
+
+pam_silhouette_plot <- fviz_silhouette(silhouette(clusterresultsPAM4)) +
+  theme(text = element_text(size = 10, face = "bold")) + 
+  labs(y="Silhouette Width")  +
+  scale_fill_manual(values = cbPalette) +
+  scale_color_manual(values = cbPalette)
+
+grid.arrange(pam_plot,pam_silhouette_plot,ncol=2,widths=6:7)
+
+```
+
+We can see that the clusters themselves are overlapping, which is not as ideal. Compared to the k-means solution, PAM does not provide distinct and non-overlapping clusters. This may be the case if the responses are all very similar.
+
+Similar to the k-means result, we can see that all clusters have values with a negative silhouette index. This result is likely due to the overlapping nature of the clusters. 
+
+Finally, we observe goodness of fit metrics in the table below.
+
+```{r,defiine pam gof stats}
+# TSS, WSS, BSS
+combcutdata <- cbind(attitudinal_data_final,pam_sum$clustering)
+#head(combcutdata)
+combcutdata <- rename(combcutdata, c("pam_sum$clustering"="cluster"))
+#head(combcutdata)
+
+##CHANGE SUBSETS BACK TO HAVE ATTITUDINAL VARIABLES
+# there isn't an easy way to calculate these metrics
+vars_to_select <- c("q24a","q24b","q24c","q24d","q24e","q25a","q25b","q25c","q25d",
+                                  "q26a","q26b","q26c","q26d","q26e")
+
+clust1 <- subset(combcutdata, cluster == 1)
+clust1 <- subset(clust1, select=vars_to_select)
+clust1 <- as.matrix(clust1,rowby=T)
+clust1mean <- matrix(apply(clust1,2,mean),nrow=1)
+dis1 <- sum(dist(clust1mean,clust1)^2)
+
+clust2 <- subset(combcutdata, cluster == 2)
+clust2 <- subset(clust2, select=vars_to_select)
+clust2 <- as.matrix(clust2,rowby=T)
+clust2mean <- matrix(apply(clust2,2,mean),nrow=1)
+dis2 <- sum(dist(clust2mean,clust2)^2)
+
+clust3 <- subset(combcutdata, cluster == 3)
+clust3 <- subset(clust3, select=vars_to_select)
+clust3 <- as.matrix(clust3,rowby=T)
+clust3mean <- matrix(apply(clust3,2,mean),nrow=1)
+dis3 <- sum(dist(clust3mean,clust3)^2)
+
+clust4 <- subset(combcutdata, cluster == 4)
+clust4 <- subset(clust4, select=vars_to_select)
+clust4 <- as.matrix(clust4,rowby=T)
+clust4mean <- matrix(apply(clust4,2,mean),nrow=1)
+dis4 <- sum(dist(clust4mean,clust4)^2)
+
+WSS <- sum(dis1,dis2,dis3,dis4)
+numsubmat <- as.matrix(attitudinal_data_final)
+overallmean <- matrix(apply(numsubmat,2,mean),nrow=1)
+TSS <- sum(dist(numsubmat,overallmean)^2)
+
+BetSS <- TSS - WSS
+## calculating the % of Between SS/ Total SS
+rsquare <- paste0(round((BetSS/TSS)*100,1),"%")
+```
+
+```{r,show pam gof stats,results='asis'}
+# tables for output
+pam_metrics <- as.data.frame(rbind(round(WSS,2),rsquare,round(pam_sum$silinfo$avg.width,2)))
+colnames(pam_metrics) <- "Result"
+pam_metrics$Metric <- c("Within SS","R-square","Avg Silhouette Width")
+pam_metrics <- pam_metrics[,c(2,1)]
+
+pam_cluster_results <- cbind(as.data.frame(seq(1,4,by=1)),as.data.frame(pam_sum$clusinfo[,1]),as.data.frame(round(pam_sum$silinfo$clus.avg.widths,2)))
+colnames(pam_cluster_results) <- c("Cluster","Size","Average Width")
+
+kable(pam_metrics, "html", booktabs = T, row.names = FALSE) %>%
+  kable_styling("striped",position = "center",full_width = FALSE) %>%
+  add_header_above(c("PAM Clustering Key Metrics" = 2))  %>%
+  row_spec(0, bold=T)
+
+kable(pam_cluster_results, "html", booktabs = T, row.names = FALSE) %>%
+  kable_styling("striped",position = "center",full_width = FALSE) %>%
+  add_header_above(c("PAM Clustering Cluster Results" = 3))  %>%
+  row_spec(0, bold=T)
+
+```
+
+From the tables above, we can see that across the board, the 4-cluster PAM solution does not offer any improvements in Within SS, R-squared, or Average Silhouette Width.
+
+Even so, the cluster sizes appear to be the most even among all the solutions. Cluster 1 does have a very low average silhouette width at .07. 
+
+In short, PAM does not seem to be a contestant for the optimal cluster solution.
+
+```{r, model based summaries}
+# library(mclust)
+# fit3 <- Mclust(attitudinal_data_final,3)
+# #plot(fit3,data=attitudinal_data_final, what="density") # plot results
+# 
+# #summary(fit3) # display the best model
+# 
+# fit4 <- Mclust(attitudinal_data_final,4)
+# #plot(fit4,data=attitudinal_data_final, what="density") # plot results
+# 
+# #summary(fit4) # display the best model
+# 
+# fit5 <- Mclust(attitudinal_data_final,5)
+# #plot(fit5,data=attitudinal_data_final, what="density") # plot results
+# 
+# #summary(fit5) # display the best model
+# 
+# fit6 <- Mclust(attitudinal_data_final,6)
+# #plot(fit6,data=attitudinal_data_final, what="density") # plot results
+# 
+# #summary(fit6) # display the best model
+# 
+# fit7 <- Mclust(attitudinal_data_final,7)
+# #plot(fit7,data=attitudinal_data_final, what="density") # plot results
+# 
+# #summary(fit7) # display the best model
+# 
+# fit8 <- Mclust(attitudinal_data_final,8)
+# #plot(fit8,data=attitudinal_data_final, what="density") # plot results
+# 
+# #summary(fit8) # display the best model
+# 
+# 
+# summary(fit3)
+# summary(fit4)
+# summary(fit5)
+# summary(fit6)
+# summary(fit7)
+# summary(fit8)
+
+```
+
+```{r,model based fitE}
+# dissE <- daisy(attitudinal_data_final)
+# #names(dissE)
+# dE2 <- dissE^2
+# # sk2 <- silhouette(fit$classification, dE2)
+# # # str(sk2)
+# # # plot(sk2)
+# # 
+# # fviz_silhouette(sk2) +
+# #   theme(text = element_text(size = 10, face = "bold")) + 
+# #   labs(y="Silhouette Width") +
+# #   scale_fill_manual(values = cbPalette) +
+# #   scale_color_manual(values = cbPalette)
+# 
+# ###############
+# 
+# sk3 <- silhouette(fit3$classification, dE2)
+# fviz_silhouette(sk3) +
+#   theme(text = element_text(size = 10, face = "bold")) +
+#   labs(y="Silhouette Width") +
+#   scale_fill_manual(values = cbPalette) +
+#   scale_color_manual(values = cbPalette)
+# 
+# sk4 <- silhouette(fit4$classification, dE2)
+# fviz_silhouette(sk4) +
+#   theme(text = element_text(size = 10, face = "bold")) +
+#   labs(y="Silhouette Width") +
+#   scale_fill_manual(values = cbPalette) +
+#   scale_color_manual(values = cbPalette)
+# 
+# sk5 <- silhouette(fit5$classification, dE2)
+# fviz_silhouette(sk5) +
+#   theme(text = element_text(size = 10, face = "bold")) +
+#   labs(y="Silhouette Width") +
+#   scale_fill_manual(values = cbPalette) +
+#   scale_color_manual(values = cbPalette)
+# 
+# sk6 <- silhouette(fit6$classification, dE2)
+# fviz_silhouette(sk6) +
+#   theme(text = element_text(size = 10, face = "bold")) +
+#   labs(y="Silhouette Width") +
+#   scale_fill_manual(values = cbPalette) +
+#   scale_color_manual(values = cbPalette)
+# 
+# sk7 <- silhouette(fit7$classification, dE2)
+# fviz_silhouette(sk7) +
+#   theme(text = element_text(size = 10, face = "bold")) +
+#   labs(y="Silhouette Width") +
+#   scale_fill_manual(values = cbPalette) +
+#   scale_color_manual(values = cbPalette)
+# 
+# sk8 <- silhouette(fit8$classification, dE2)
+# fviz_silhouette(sk8) +
+#   theme(text = element_text(size = 10, face = "bold")) +
+#   labs(y="Silhouette Width") +
+#   scale_fill_manual(values = cbPalette) +
+#   scale_color_manual(values = cbPalette)
+
+```
+
+## Cluster Comparisons
+
+Before we compare and select our final cluster solution, it is important to mention that model-based methods were considered but ultimately results were not shown.
+
+As a final step before selecting the optimal cluster solution for this business problem, we calculate the Adjusted Rand Index. The Adjusted Rand Index can be interpreted similar to R-squared and captures the amount of agreement across the cluster solutions. Because our clustering techniques are each utilizing a different number of clusters, this step is helpful for comparison.
+
+```{r, calculate adjusted rand index for best models}
+final_hclust <- cut.2
+final_kmeans <- clusterresults5$cluster 
+final_pam <- pam_sum$clustering
+#final_modelbased <- fit4$classification
+#final_modelbased
+
+clstat <- cluster.stats(my.data.dist, final_hclust, final_kmeans, final_pam)
+rand_all <- paste0(round(clstat$corrected.rand*100,0),"%") #24% - orig / 25% - transformed
+## if i change k-means to 2 then i get 97%
+## if i just do kmeans, pam, modelbased, i get 97%
+
+## corrected or adjusted rand index lies between 0 & 1
+## perfect match between 2 clustering methods means 1, no match means 0
+## any number in between represents 'kind of' % of matched pairs 
+
+clstat <- cluster.stats(my.data.dist, final_kmeans, final_pam)
+rand_kmeans_pam <- paste0(round(clstat$corrected.rand*100,0),"%")  #44.8% - julia / 44.8 - professor /97% - transformed
+# with k-means as 2 i get 85% here
+
+clstat <- cluster.stats(my.data.dist, final_kmeans, final_hclust)
+rand_kmeans_hclust <- paste0(round(clstat$corrected.rand*100,0),"%")  
+
+clstat <- cluster.stats(my.data.dist, final_pam, final_hclust)
+rand_pam_hclust <- paste0(round(clstat$corrected.rand*100,0),"%") 
+
+```
+
+```{r,show rand output,align='center'}
+rand_metrics <- as.data.frame(rbind(rand_all,rand_kmeans_pam,rand_kmeans_hclust,rand_pam_hclust))
+colnames(rand_metrics) <- "Adjusted Rand Index"
+rand_metrics$Scope <- c("All Solutions","K-means & PAM","Hierarchical & K-means","Hierarchical & PAM")
+rand_metrics <- rand_metrics[,c(2,1)]
+
+kable(rand_metrics, "html", booktabs = T, row.names = FALSE) %>%
+  kable_styling("striped",position = "center",full_width = FALSE) %>%
+  row_spec(0, bold=T)
+```
+
+From the table above, we can see that across our clusters, there is less than desirable alignment, as the Adjusted Rand Index is less than 20%. However, between K-means and PAM we see much greater alignment, as the Adjusted Rand Index is `r rand_kmeans_pam`.
+
+In summary, we select the 5-cluster K-means solution as our final cluster solution, as it had the highest average silhouette index and had fairly good R-squared and Within SS results.
+
+## Profiles
+
+In this section, we develop profiles for each of the five clusters. We consider all available variables in this data set, as it is important to see how the clusters vary using the demographic and behavioral variables.
+
+In some cases, question responses are grouped together to better able to visualize and discern trends. For instance, age groups are bucketed together into 10-year spans instead of 5-year spans to more readily assess patterns.
+
+Visuals that were used to create the profiles are shown in the Appendix.
+
+
+```{r,define profile df}
+final_cluster <- as.data.frame(final_kmeans) 
+final_cluster <- tibble::rownames_to_column(final_cluster)
+final_cluster <- final_cluster %>%
+  mutate(rowname2 = as.integer(rowname)) %>%
+  dplyr::rename(cluster = final_kmeans) %>%
+  select(-rowname)
+
+attitudinal_data_final2 <- attitudinal_data_final %>%
+  dplyr::mutate(row_num = row_number())
+
+numdata_with_clusters <- numdata_complete %>%
+  left_join(id_mapping,by="caseID") %>%
+  left_join(final_cluster,by=c("row_num"="rowname2")) %>%
+  left_join(attitudinal_data_final2,by="row_num") 
+
+# colnames(numdata_with_clusters)
+# test = numdata_with_clusters %>% filter(outlier_flag == 1)
+# table(numdata_with_clusters$cluster)
+# clusterresults5$size #have to see that this matches the above
+
+```
+
+```{r demographic summaries}
+# define main demographic_sum df
+demographic_sum <- numdata_with_clusters %>%
+  filter(!is.na(cluster)) %>%
+  group_by(cluster) %>%
+  mutate(count = n()) %>%
+  group_by(cluster, count) %>%
+  dplyr::summarize_at(vars(q1, q48, q49, q54, q55, q56, q57), funs(median,mean)) %>%
+  ungroup()
+```
+
+```{r, mapping for demographic vars}
+# we need to convert the demographic vars from numerics to factors
+# to make plots easy to read
+age_function <- function(x){
+  ifelse(x >= 11, "60+",
+         ifelse(x >= 10, "60+",
+                ifelse(x >= 9, "50-59",
+                       ifelse(x >= 8, "50-59",
+                              ifelse(x >= 7, "40-49",
+                                     ifelse(x >= 6, "40-49",
+                                            ifelse(x >= 5, "30-39",
+                                                   ifelse(x >= 4, "30-39",
+                                                          ifelse(x >= 3, "18-29",
+                                                                 ifelse(x >= 2,                                                                   "18-29","<18"))))))))))
+}
+
+education_function <- function(x){
+  ifelse(x >= 6, "Post grad",
+         ifelse(x >= 5, "Post grad",
+                ifelse(x >= 4, "College",
+                       ifelse(x >= 3, "College",
+                              ifelse(x >= 2,"High school","High school")))))
+}
+
+income_function <- function(x){
+  ifelse(x >= 12, "$100K+",
+         ifelse(x >= 7, "$50-$99K","<$50K")) 
+}
+
+marital_function <- function(x){
+  ifelse(x == 4, "Separated",
+         ifelse(x == 3 | x == 1, "Married","Single")) 
+}
+
+race_function <- function(x){
+  ifelse(x >= 6, "Other",
+         ifelse(x >= 5, "American Indian/\nAlaska Native",
+                ifelse(x >= 4, "Native Hawaiian/\nPacific Islander",
+                       ifelse(x >= 3, "Asian",
+                              ifelse(x >= 2, "Black","White")))))
+  
+}
+
+gender_function <- function(x){
+  ifelse(x == 1, "Male","Female")
+}
+
+latino_function <- function(x){
+  ifelse(x == 1, "Yes","No")
+}
+
+```
+
+```{r, function for other summaries and summary dfs}
+demographic_sum_function <- function(x){
+  numdata_with_clusters %>%
+    filter(!is.na(cluster)) %>%
+    group_by(cluster,{{x}}) %>%
+    dplyr::summarise(count=n()) %>%
+    ungroup() %>%
+    group_by(cluster) %>%
+    dplyr::mutate(percent = count/sum(count))
+}
+
+# define other dfs for summaries
+demographic_age_sum <- demographic_sum_function(q1) %>%
+  mutate(q1 = age_function(q1))
+
+demographic_education_sum <- demographic_sum_function(q48) %>%
+  mutate(q48 = education_function(q48))
+
+demographic_marital_sum <- demographic_sum_function(q49) %>%
+  mutate(q49 = marital_function(q49))
+
+demographic_race_sum <- demographic_sum_function(q54) %>%
+  mutate(q54 = race_function(q54))
+
+demographic_latino_sum <- demographic_sum_function(q55) %>%
+  mutate(q55 = latino_function(q55))
+
+demographic_income_sum <- demographic_sum_function(q56) %>%
+  mutate(q56 = income_function(q56))
+
+demographic_gender_sum <- demographic_sum_function(q57) %>%
+  mutate(q57 = gender_function(q57))
+
+```
+
+```{r, function for demographic visuals}
+demographic_plot_function <- function(df,x,mytitle){
+  df %>%
+    group_by(cluster,{{x}}) %>%
+    dplyr::summarise(count=sum(count)) %>%
+    ungroup() %>%
+    group_by(cluster) %>%
+    dplyr::mutate(percent = count/sum(count)) %>%
+    ggplot(aes(x={{x}},y=percent,fill=as.factor(cluster))) +
+    geom_bar(stat="identity") +
+    facet_grid(.~cluster) +
+    scale_fill_manual(values=cbPalette) +
+    guides(fill=FALSE) +
+    labs(title=mytitle,x="",y="") +
+    theme(text = element_text(size = 10, face = "bold"),axis.text.x = element_text(size=6)) +
+    geom_text(aes(label=paste0(round(percent*100,0),"%")),position=position_stack(vjust=.5),size=3) +
+    coord_flip() +
+    scale_y_continuous(labels=function(x){paste0(round(x*100,0),"%")})
+  
+}
+```
+
+```{r,demographics visuals,fig.width=12, fig.height=11}
+# visuals
+age_plot <- demographic_plot_function(demographic_age_sum,q1,"Age")
+
+education_plot <- demographic_plot_function(demographic_education_sum,q48,"Education")
+
+marital_plot <- demographic_plot_function(demographic_marital_sum,q49,"Marital")
+ 
+race_plot <- demographic_plot_function(demographic_race_sum,q54,"Race")
+ 
+latino_plot <- demographic_plot_function(demographic_latino_sum,q55,"Latino")
+
+income_plot <- demographic_plot_function(demographic_income_sum,q56,"Income")
+ 
+gender_plot <- demographic_plot_function(demographic_gender_sum,q57,"Gender")
+```
+
+```{r, behavioral data prep functions}
+sum_gather_function <- function(condition){
+  
+  if(condition!="q13r"){
+    numdata_with_clusters %>%
+      filter(!is.na(cluster)) %>%
+      select(caseID,cluster,contains(condition)) %>%
+      gather("question","response",contains(condition)) %>%
+      group_by(cluster,question) %>%
+      dplyr::summarise(total=sum(response)) %>%
+      ungroup() %>%
+      group_by(cluster) %>%
+      dplyr::mutate(percent=total/sum(total))  %>%
+      ungroup()
+  } else {
+      numdata_with_clusters %>%
+        filter(!is.na(cluster)) %>%
+        select(caseID,cluster,contains(condition)) %>%
+        gather("question","response",contains(condition)) %>%
+        group_by(cluster,question,response) %>%
+        dplyr::summarise(total=sum(response)) %>%
+        ungroup() %>%
+        group_by(cluster) %>%
+        dplyr::mutate(percent=total/sum(total))  %>%
+        ungroup()
+    }
+}
+
+sum_function <- function(x){
+  numdata_with_clusters %>%
+    filter(!is.na(cluster)) %>%
+    group_by(cluster,{{x}}) %>%
+    dplyr::summarise(total=n()) %>%
+    ungroup() %>%
+    group_by(cluster) %>%
+    dplyr::mutate(percent=total/sum(total)) %>%
+    ungroup()
+}
+```
+
+```{r, behavioral var transformations}
+q2_function <- function(x){
+    fct_recode(x,"iPhone"="q2r1","iPod touch"="q2r2","Android"="q2r3","BlackBerry"= "q2r4", "Nokia"="q2r5","Windows"="q2r6", "HP/Palm\nWebOS"="q2r7","Tablet"="q2r8", "Other"="q2r9")
+}
+
+q4_function <- function(x){
+    fct_recode(x, "Music" ="q4r1" ,"TV Check-in"="q4r2","Entertainment" ="q4r3", "TV Show" = "q4r4", "Gaming" ="q4r5","Social Networking"="q4r6","General News"="q4r7","Shopping"="q4r8","Specific News"= "q4r9","Other"= "q4r10" ,"None" ="q4r11")
+}
+
+q11_function <- function(x){
+  ifelse(x >= 6,"None",
+         ifelse(x >= 5,"Don't Know",
+                ifelse(x >= 4,"31+",
+                       ifelse(x >= 3,"11-30",
+                              ifelse(x >= 2,"6-10","1-5")))))
+}
+
+q12_function <- function(x){
+  ifelse(x >= 6, "All free",
+         ifelse(x >= 5, "76%-99%",
+                ifelse(x >= 4, "51%-75%",
+                       ifelse(x >= 3, "26%-50%",
+                              ifelse(x >= 2, "1%-25%","None")))))
+}
+
+q13_function <- function(x){
+  fct_recode(x,"Facebook" ="q13r1","Twitter" ="q13r2","Myspace" ="q13r3","Pandora" ="q13r4","Vevo" ="q13r5","YouTube" ="q13r6","AOL Radio" ="q13r7","Last.fm" ="q13r8","Yahoo" ="q13r9","IMDB" ="q13r10","LinkedIn" ="q13r11","Netflix" ="q13r12")
+}
+
+```
+
+```{r behavioral summary dfs}
+q2_sum <- sum_gather_function("q2r") %>%
+  mutate(question = q2_function(question)) %>%
+  filter(question != "q2r10") # should be retired
+
+q4_sum <- sum_gather_function("q4r") %>%
+  mutate(question = q4_function(question))
+
+q11_sum <- sum_function(q11) %>%
+  dplyr::rename(question = q11) %>%
+  mutate(question = q11_function(question),
+         question = factor(question,levels=c("None","1-5","6-10","11-30","31+","Don't Know")))
+
+q12_sum <- sum_function(q12) %>%
+  dplyr::rename(question = q12) %>%
+  mutate(question = q12_function(question),
+         question = factor(question,levels=c("None","1%-25%","26%-50%","51%-75%","76%-99%","All free")))
+
+q13_sum <- sum_gather_function("q13r") %>%
+  mutate(question = q13_function(question),
+         response = ifelse(response >= 4, "Almost never",
+                           ifelse(response >= 3, "Rarely", 
+                                  ifelse(response >= 2, "Sometimes", "Very Often"))),
+         respone = factor(response,levels=c("Very Often","Sometimes","Rarely","Almost never")))
+
+```
+
+```{r, behaviorial plot function}
+behaviorial_plot_function <- function(df,mytitle){
+  if(!grepl("website",mytitle,ignore.case = TRUE)){
+  df %>%
+    ggplot(aes(x=question,y=percent,fill=as.factor(cluster))) +
+    geom_bar(stat="identity") +
+    facet_grid(.~cluster) +
+    scale_fill_manual(values=cbPalette) +
+    guides(fill=FALSE) +
+    labs(title=mytitle,x="",y="") +
+    theme(text = element_text(size = 10, face = "bold"),axis.text.x = element_text(size=6)) +
+    geom_text(aes(label=paste0(round(percent*100,0),"%")),position=position_stack(vjust=.5),size=3) +
+    coord_flip() +
+    scale_y_continuous(labels=function(x){paste0(round(x*100,0),"%")})
+  } else {
+    df %>%
+      ggplot(aes(x=question,y=percent,fill=as.factor(cluster))) +
+      geom_bar(stat="identity") +
+      facet_grid(cluster~response) +
+      scale_fill_manual(values=cbPalette) +
+      guides(fill=FALSE) +
+      labs(title=mytitle,x="",y="") +
+      theme(text = element_text(size = 10, face = "bold"),axis.text.x = element_text(size=6)) +
+      geom_text(aes(label=paste0(round(percent*100,0),"%")),position=position_stack(vjust=.5),size=3) +
+      coord_flip() +
+      scale_y_continuous(labels=function(x){paste0(round(x*100,0),"%")})
+  }
+}
+```
+
+```{r, behaviorial plots}
+smartphones_plot <- behaviorial_plot_function(q2_sum,"Smartphones")
+
+app_usage_plot <- behaviorial_plot_function(q4_sum,"App Usage")
+
+app_total_plot <- behaviorial_plot_function(q11_sum,"App Total")
+  
+app_download_plot <- behaviorial_plot_function(q12_sum,"App % Free to Download")
+
+website_usage_plot <- behaviorial_plot_function(q13_sum,"Website Usage")
+
+```
+
+```{r,attitudinal plot function}
+attitudinal_plot_function <- function(df,mytitle){
+  df %>%
+    ggplot(aes(x=question,y=response,fill=as.factor(cluster))) +
+    geom_bar(stat="identity") +
+    facet_grid(.~cluster) +
+    scale_fill_manual(values=cbPalette) +
+    guides(fill=FALSE) +
+    labs(title=mytitle,x="",y="") +
+    theme(text = element_text(size = 10, face = "bold")) +
+    geom_text(aes(label=round(response,1)),position=position_stack(vjust=.5),size=3) +
+    coord_flip()
+}
+```
+
+
+```{r, attitudinal plots}
+# create summary df
+# could also just look at raw questions
+attitudinal_data_sum <- numdata_with_clusters %>%
+  filter(!is.na(cluster)) %>%
+  # this is how we get the collapsed vars
+  select(-contains("r"),cluster) %>% 
+  group_by(cluster) %>%
+  summarise_all(mean)
+
+# generate plots
+technology_plot <- attitudinal_data_sum %>%
+  select(cluster,q24a,q24b,q24c,q24d,q24e) %>%
+  gather("question","response",2:6) %>%
+  mutate(question = fct_recode(question, "Positive toward\ntechnology" ="q24a","Technology\nbenefits" ="q24b", "Music/TV"= "q24c","Communications"= "q24d","Negative toward\ntechnology" ="q24e")) %>%
+  attitudinal_plot_function("Technology")
+  
+leadership_plot <- attitudinal_data_sum %>%
+  select(cluster,q25a,q25b,q25c,q25d) %>%
+  gather("question","response",2:5) %>%
+  mutate(question = fct_recode(question, "Leadership" ="q25a","Sense of\ncontrol" ="q25b", "Drive"= "q25c","Negative toward\nleadership"= "q25d")) %>%
+  attitudinal_plot_function("Leadership")
+
+shopping_plot <- attitudinal_data_sum %>%
+  select(cluster,q26a,q26b,q26c,q26d,q26e) %>%
+  gather("question","response",2:6) %>%
+  mutate(question = fct_recode(question, "Bargain\nshopping" ="q26a","App show\noff" ="q26b", "Children"= "q26c","Money toward\nPhone/App"= "q26d","High End\nBrands" ="q26e")) %>%
+  attitudinal_plot_function("Shopping")
+```
+
+In assessing which clusters are more advantageous for App Happy on the basis of attitudinal questions alone, it is assumed that leadership question responses play a minimal role. The rationale for this assumption is that App Happy is wanting to create a social entertainment app, and leadership does not play a strong role in this process. In contrast, it is assumed that finding groups that are positive toward technology and score high on the app show off and money toward phone/app question are desirable.
+
+Therefore, in total, we can summarize our five clusters as follows:
+
+**Social Climbers (Cluster 1)**
+
+With modest incomes and more high school graduates, the Social Climber's primary focus is on social networking, shopping, and entertainment and showing off their app choices. This group has good representation from all ages, has slightly more males, and has a very positive outlook toward technology. Even though a majority of people in this group are married, their children do not influence their app choices. 
+
+**Family Focused Shoppers (Cluster 2)**
+
+Family Focused Shoppers are middle-aged individuals, who have high interest in technology and their children. They are also a well-educated group, with 84% having college or post grad experience. They use apps for all kinds of needs, but their children do influence their app download choices. 
+
+**Variety Seekers (Cluster 3)**
+
+With average interest in technology, leadership, and shopping, the Variety Seekers need constant change to stay engaged. Their primary interest in apps is for news information. A strong proportion of users (43%) in this group are between the ages of 18-29, and there are more users from mixed races or who are Latino. 
+
+**No Techies (Cluster 4)**
+
+Even though 46% of people use an iPhone or iPod touch, the No Techies group does not see the appeal in technology. With 40% of people having 31+ apps, this group likes to use apps for their own purposes and does not enjoy shopping or paying extra for app features. This group will be challenging to try and turn into an advocate for a product or feature.
+
+**Internal Focus (Cluster 5)**
+
+With primarily young, female users, this group has high interest in using apps for social networking, music, and entertainment. In fact, 75% of users have 11 or more apps. While they are not as interested in shopping, they are focused on themselves, as 50% of this group are either single or separated. If the right product or feature comes along, this group has money and drive to pay for those features.
+
+Based on the observations from the visuals above, it is worth mentioning that these segments are not mutually exclusive. In other words, these segments are not distinct, which is a result of many reasons that are highlighted in detail in the Summary and Conclusions section.
+
+Even still, input is needed from App Happy to determine which groups are most optimal for their new app. Their preferences for an ideal customer also play a role here. For instance, Social Climbers and Internal Focus groups have a higher focus on social networking and entertainment than other groups. In contrast, the Family Friendly Shoppers is more family-oriented and let their children influence their app download preferences. If App Happy wants young, up-and-coming users to use their new app, then Social Climbers and Internal Focus would be great candidates. However, if App Happy wants to see how their new app resonates with all kinds of users, then Family Focused Shoppers or even Variety Seekers may be able to offer that perspective. The No Techies group is not recommended as a good fit due to their negative attitudes toward technology.
+
+By leveraging App Happy's goals for this new app, the choice for which segment to use will be very clear.
+
+# Classification
+
+To appropriately classify new customers into existing segments, one of the main considerations is if the data that was used to develop the segmentation scheme will be available/accessible for new customers. Generally, classifying new customers into existing segments uses the original variables or a subset of the original variables. In some cases, completely new data/questions are used, but in this scenario, the accuracy of the clusters and the classification results would be under question. Therefore, it is recommended that either the full set of original variables (survey) or a subset of those questions be collected for new customers. The subset should be based on variables where there were noticeable differences across the segments.
+
+To develop the classification model, there are several different methods that should be used to compare and contrast results.
+
+**CART or Classification & Regression Trees methodology** is a decision-tree method that uses the most important questions to split data into different groups. Since our goal is to determine which segment a new customer belongs to, CART would be used for classification instead of predicting an end value. For instance, if age varied across different segments, then CART might use this question first to split the data and then would ask other questions based on these split groups to get down to cluster assignment. There are various rules that need to be defined for this method, such as choosing questions for splitting and defining tree depth and stopping rules. With CART, there is flexibility to ensure no overfitting through pruning of the trees, which in essence simplifies the splitting rules by removing parts of the tree that have little classification power.
+
+**Discriminant Analysis** is a statistical procedure founded in conditional probabilities. The primary goal is to understand the conditional probability that a customer is in a certain segment given the available data. A customer is assigned into a segment where it has the greatest conditional probability. Discriminant analysis creates discrimannt functions, which are akin to linear models using the most important predictors. The overall procedure may vary based on how many segments are used, but overall, an end user is able to plug in known values into a model and get a classification output.
+
+There are other methods, such as Linear Probability Models or even Logistic Regression, that may be used to classify customers. In short, multiple methods should be compared and contrasted against one another to determine which approach is optimal. To assess goodness of fit, a confusion matrix can be used to report on accuracy and misclassification rates.
+
+It is worth mentioning that it would be advantageous to develop this classification model while creating the segmentation scheme. By doing this, the classification model would be able to be validated on the original data through cross validation procedures.
+
+Depending on App Happy's needs, this classification or typing tool could be something that is controlled by marketing, such as in the form of an Excel spreadsheet, or it could be setup where new customers are assigned a segment on a regular basis (i.e. every day, every week, etc.). In other words, there is flexibility on how this solution is implemented.
+
+# Summary and Conclusions
+
+In summary, survey data from 1800 respondents were used to develop a customer segmentation scheme for App Happy to use to inform recommendations for the up and coming social entertainment app. As part of data exploration, missing values for two variables were imputed using the R mice package. More importantly, variables were recoded and grouped/averaged together to better discern trends within the data. Normalizing the transformed variables was considered but was ultimately eliminated as it did not increase the signal within the data. Before moving forward with the clustering process, 31 data points were removed as they were either outliers from a PCA perspective or had atypical responses. Therefore, the clustering process was accomplished using 1769 responses.
+
+Using the 14 newly-created attitudinal survey questions, the clustering techniques of hierarchical clustering, k-means, and PAM were explored. The 5-cluster k-means solution was selected as the optimal solution because of its moderate R-squared value and high relative average silhouette width. There was greater alignment between the PAM and k-means solutions than with the hierarchical clustering solution on the basis of Adjusted Rand index.
+
+Profiling was done on the 5-clusters using all of the available data. Across the demographic, behavioral, and attitudinal responses, a key theme that was observed was similarity across all the clusters. Despite this observations, profiles were able to be created, with recommendations given for the Social Climbers, Internal Focus, and Family Focused Shoppers. Having more insight into App Happy's goals as an organization and their goals for this new social entertainment app will help to validate that the best segment is chosen.
+
+The lackluster goodness of fit metrics as well as the observed similarity across the clusters raises several concerns on the validity of the data. First, it is unclear if the survey questions actually measured what App Happy intended to measure. Based on their desire to develop a social entertainment app, the questions do not feature social entertainment activities (i.e. movies, concerts) or relevant features within a potential social entertainment app (i.e. online chat, location sharing). Instead, broad-based questions were asked across technology, leadership, shopping, and general website or app download usage. As it stands, it is unclear the relevance these categories have on the social media app development, and more targeted questions might have yielded more interesting results. 
+
+Additionally, the questions that were asked were very specific and call into question the survey design. For instance, for the website usage question, the majority of the people do not go to the websites listed as options, which means that the options provided are of poor quality. Moreover, question 12 asks about the percentage of apps that were free to download, and the responses provided are a very specific number (i.e. 51% - 75%), and it is unclear how these questions can be answered with good accuracy. Finally, as a general observation, the attitudinal questions used a Likert scale from 1-6. While it is unknown if definitions were provided on the differences between these responses, it seems like less options could have been given, say a 1-5 scale, to prohibit a lot of people answering in the middle (responses of 2-4). All in all, the choice of questions and the design of those questions are called into question based on the business problem at hand. 
+
+Moreover, it is unclear who took this survey, and if this population is reflective of potential App Happy customers. Having a biased sample undermines the end results.
+
+Also, without insight into App Happy's goals, it is challenging to determine who their ideal customer might be and if these segments are realistic. For instance, if App Happy really wants to market their social entertainment app to families, then anyone who is not married would have been removed. With this kind of information, the resulting analyses might have been more meaningful as the scope of questions or responses considered would have been adjusted.
+
+Finally, this segmentation scheme was built using only the attitudinal responses and experienced underwhelming results. If the behavioral or demographic questions had been considered for the scheme, then the end clusters might have been more distinct. Regardless, if these segments are to be used on a future basis, then ensuring that the clusters are built using data that will be available for new customers is key. In this case, it is unknown if the similar/same attitudinal data can be collected on new customers. With this information in mind, a new survey might be designed that will yield more consistent and accurate results for new customers.
+
+# Appendix
+
+Below are visuals used for developing the profiles. Of note, the visuals are shown from the perspective of each cluster. This decision was made to better enable creation of the profiles.
+
+We start by analyzing distributions among the demographic variables.
+
+```{r, show demographic plots, fig.width=12, fig.height=11}
+grid.arrange(age_plot, gender_plot, marital_plot, income_plot, education_plot, race_plot, latino_plot,
+             widths=5:6,ncol=2,top=textGrob("Demographic Variables", gp=gpar(fontsize=14, fontface = "bold")))
+
+```
+
+From the visuals above, we observe the following:
+
+* In general, the demographics across clusters are very similar. There are only very slight differences between different categories of responses, and most clusters have responses across all categories.
+* The age, education, and latino distributions are very similar across clusters and there are no worthwhile differences to report.
+* Clusters 4 and 5 have more females, while cluster 1 has more males.
+* In clusters 2 and 4, the majority (60%) of respondents are married, while cluster 5 has more singles and divorcees.
+* Clusters 4 and 5 have more individuals in the $50K+ and $100K+ buckets, while cluster 3 has slightly lower incomes.
+
+Next, we examine responses to the behavioral questions.
+
+```{r, show behavioral plots1, fig.width=12, fig.height=8}
+grid.arrange(smartphones_plot,app_total_plot,app_usage_plot, app_download_plot, widths=5:6,ncol=2,top=textGrob("Behavioral Variables", gp=gpar(fontsize=14, fontface = "bold")))
+
+```
+
+```{r, show behavioral plots2, fig.width=12, fig.height=8}
+grid.arrange(website_usage_plot,ncol=1)
+
+```
+
+From the behavioral variables visuals, we also see a very similar distribution of responses across all clusters. Cluster 4 has more iPhone and iPod touch users, while cluster 5 has a slightly higher proportion of respondents who have 11+ apps. In the website usage question, it appears that most respondents do not regularly go to the websites listed in the question. Therefore, it seems that this question is not that helpful and cannot reveal any interesting information.
+
+Finally, we examine responses to the attitudinal questions across clusters. For the attitudinal variables, a lower value means stronger agreement. The values were left in their numeric form as only averages are shown for simplicity.
+
+```{r,show attitudinal plots,fig.width=12, fig.height=6}
+grid.arrange(technology_plot, leadership_plot, shopping_plot, ncol=2,top=textGrob("Averages of Attitudinal Variables", gp=gpar(fontsize=14, fontface = "bold")))
+```
+
+From the responses above, we can discern the following:
+
+* Clusters 1 and 2 have a low average on all questions, which indicates stronger agreement.
+* Cluster 3 has very middle of the road responses to all questions.
+* Cluster 4 has stronger disagreement, especially in the shopping section.
+* Cluster 5 has very average responses but does have higher disagreement on the negative toward leadership and children shopping questions.
